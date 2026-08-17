@@ -14,10 +14,6 @@ services:
         condition: service_healthy
     environment:
       ENTE_CREDENTIALS_FILE: /credentials.yaml
-    volumes:
-      - ./museum.yaml:/museum.yaml:ro
-      - ./credentials.yaml:/credentials.yaml:ro
-      - ./data:/data:ro
     networks:
       - museum-backend
 
