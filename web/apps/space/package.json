@@ -13,9 +13,8 @@
         "ente-accounts": "*",
         "ente-base": "*",
         "ente-media": "*",
+        "ente-prelogin-wasm": "*",
         "ente-space-wasm": "*",
-        "ente-wasm": "*",
-        "ente-wasm-core": "*",
         "photoswipe": "5.4.4",
         "react-easy-crop": "5.5.7",
         "thumbhash": "0.1.1"

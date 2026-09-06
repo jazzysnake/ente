@@ -31,6 +31,7 @@ import "package:photos/services/smart_memories_service.dart";
 import "package:photos/ui/actions/file/file_actions.dart";
 import "package:photos/ui/collections/collection_action_sheet.dart";
 import "package:photos/ui/home/memories/custom_listener.dart";
+import "package:photos/ui/home/memories/memory_music_session.dart";
 import "package:photos/ui/home/memories/memory_progress_indicator.dart";
 import "package:photos/ui/home/memories/memory_share_sheet.dart";
 import "package:photos/ui/home/memories/memory_video_prefetcher.dart";
@@ -43,7 +44,7 @@ import "package:photos/ui/viewer/gallery/jump_to_date_gallery.dart";
 import "package:photos/utils/dialog_util.dart";
 import "package:photos/utils/share_util.dart";
 
-const _socialRightInset = 24.0;
+const _memoryOverlayHorizontalInset = 24.0;
 const _socialToActionBarGap = 38.0;
 const _memoryCaptionHorizontalInset = 16.0;
 const _memoryCaptionActionBarGap = 4.0;
@@ -313,14 +314,20 @@ class FullScreenMemoryData extends InheritedWidget {
 class FullScreenMemory extends StatefulWidget {
   final String title;
   final int initialIndex;
+  final String memoryID;
+  final bool isActive;
   final VoidCallback? onNextMemory;
   final VoidCallback? onPreviousMemory;
+  final ValueChanged<bool>? onMediaInteractionLockChanged;
 
   const FullScreenMemory(
     this.title,
     this.initialIndex, {
+    required this.memoryID,
+    required this.isActive,
     this.onNextMemory,
     this.onPreviousMemory,
+    this.onMediaInteractionLockChanged,
     super.key,
   });
 
@@ -349,10 +356,14 @@ class _FullScreenMemoryState extends State<FullScreenMemory> {
   // invalidates the prior delayed forward.
   Object? _kenBurnsStartToken;
   bool _isViewerPaused = false;
+  bool _isMusicViewerActionPaused = false;
   bool _isPlaybackPaused = false;
-  bool get _isAnimationPaused => _isViewerPaused || _isPlaybackPaused;
-  bool _isMediaZoomed = false;
+  bool get _isAnimationPaused =>
+      !widget.isActive || _isViewerPaused || _isPlaybackPaused;
+  bool _isMediaInteractionLocked = false;
   final _socialControlsVisible = ValueNotifier<bool>(false);
+  FullScreenMemoryData? _memoryData;
+  ValueNotifier<int>? _itemIndexNotifier;
 
   final hasPointerOnScreenNotifier = ValueNotifier<bool>(false);
   bool hasFinalFileLoaded = false;
@@ -373,7 +384,7 @@ class _FullScreenMemoryState extends State<FullScreenMemory> {
 
     _detailSheetEventSubscription = Bus.instance.on<DetailsSheetEvent>().listen(
       (event) {
-        if (!mounted) return;
+        if (!mounted || !widget.isActive) return;
         final inheritedData = FullScreenMemoryData.of(context);
         if (inheritedData == null) return;
         final index = inheritedData.indexNotifier.value;
@@ -386,7 +397,7 @@ class _FullScreenMemoryState extends State<FullScreenMemory> {
           uploadedFileID: currentFile.uploadedFileID,
           localID: currentFile.localID,
         )) {
-          _toggleAnimation(pause: event.opened);
+          event.opened ? _pauseViewer() : _resumeViewer();
         }
       },
     );
@@ -408,12 +419,61 @@ class _FullScreenMemoryState extends State<FullScreenMemory> {
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final memoryData = FullScreenMemoryData.of(context);
+    _memoryData = memoryData;
+    final nextNotifier = memoryData?.indexNotifier;
+    if (identical(nextNotifier, _itemIndexNotifier)) {
+      _activateCurrentItemMusic();
+      return;
+    }
+    _itemIndexNotifier?.removeListener(_activateCurrentItemMusic);
+    _itemIndexNotifier = nextNotifier;
+    _itemIndexNotifier?.addListener(_activateCurrentItemMusic);
+    _activateCurrentItemMusic();
+  }
+
+  @override
+  void didUpdateWidget(covariant FullScreenMemory oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.isActive == widget.isActive) return;
+    _syncAnimationState();
+    if (widget.isActive) _activateCurrentItemMusic();
+  }
+
+  @override
   void dispose() {
+    _itemIndexNotifier?.removeListener(_activateCurrentItemMusic);
     hasPointerOnScreenNotifier.removeListener(_hasPointerListener);
     _detailSheetEventSubscription.cancel();
     _captionUpdatedSubscription.cancel();
     _socialControlsVisible.dispose();
     super.dispose();
+  }
+
+  void _activateCurrentItemMusic() {
+    if (!mounted || !widget.isActive) return;
+    final inheritedData = _memoryData;
+    if (inheritedData == null) return;
+    final index = _clampedMemoryIndex(
+      inheritedData.indexNotifier.value,
+      inheritedData.memories.length,
+    );
+    if (index == null) return;
+    final file = inheritedData.memories[index].file;
+    final controller = MemoryMusicScope.maybeOf(
+      context,
+      listen: false,
+    )?.controller;
+    if (controller == null) return;
+    unawaited(controller.setViewerActionPaused(_isMusicViewerActionPaused));
+    unawaited(
+      controller.activateMemory(
+        widget.memoryID,
+        currentItemIsVideo: file.fileType == FileType.video,
+      ),
+    );
   }
 
   void _hasPointerListener() {
@@ -533,8 +593,9 @@ class _FullScreenMemoryState extends State<FullScreenMemory> {
   }
 
   void _goToNext(FullScreenMemoryData inheritedData) {
+    if (!widget.isActive) return;
     if (inheritedData.memories.isEmpty) return;
-    _isMediaZoomed = false;
+    _isMediaInteractionLocked = false;
     hasFinalFileLoaded = false;
     final currentIndex = _clampedMemoryIndex(
       inheritedData.indexNotifier.value,
@@ -554,8 +615,9 @@ class _FullScreenMemoryState extends State<FullScreenMemory> {
   }
 
   void _goToPrevious(FullScreenMemoryData inheritedData) {
+    if (!widget.isActive) return;
     if (inheritedData.memories.isEmpty) return;
-    _isMediaZoomed = false;
+    _isMediaInteractionLocked = false;
     hasFinalFileLoaded = false;
     final currentIndex = _clampedMemoryIndex(
       inheritedData.indexNotifier.value,
@@ -577,7 +639,15 @@ class _FullScreenMemoryState extends State<FullScreenMemory> {
 
   void _onPageChange(FullScreenMemoryData inheritedData, int index) {
     if (!_isValidMemoryIndex(index, inheritedData.memories.length)) return;
-    _isMediaZoomed = false;
+    final currentIndex = _clampedMemoryIndex(
+      inheritedData.indexNotifier.value,
+      inheritedData.memories.length,
+    );
+    if (currentIndex != null &&
+        inheritedData.memories[currentIndex].file.fileType == FileType.video) {
+      Bus.instance.fire(PauseVideoEvent());
+    }
+    _isMediaInteractionLocked = false;
     isAtFirstOrLastFile = false;
     unawaited(
       memoriesCacheService.markMemoryAsSeen(
@@ -607,19 +677,36 @@ class _FullScreenMemoryState extends State<FullScreenMemory> {
 
   void _pauseViewer() {
     if (!mounted) return;
+    _isMusicViewerActionPaused = true;
+    final controller = MemoryMusicScope.maybeOf(
+      context,
+      listen: false,
+    )?.controller;
+    if (controller != null) {
+      unawaited(controller.setViewerActionPaused(true));
+    }
     _toggleAnimation(pause: true);
     Bus.instance.fire(PauseVideoEvent());
   }
 
   void _resumeViewer() {
     if (!mounted) return;
+    _isMusicViewerActionPaused = false;
     Bus.instance.fire(ResumeVideoEvent());
     _toggleAnimation(pause: false);
+    final controller = MemoryMusicScope.maybeOf(
+      context,
+      listen: false,
+    )?.controller;
+    if (controller != null) {
+      unawaited(controller.setViewerActionPaused(false));
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     final inheritedData = FullScreenMemoryData.of(context);
+    final memoryMusic = MemoryMusicScope.maybeOf(context);
     if (inheritedData == null || inheritedData.memories.isEmpty) {
       return const SizedBox.shrink();
     }
@@ -678,11 +765,9 @@ class _FullScreenMemoryState extends State<FullScreenMemory> {
                   },
                   onSwipeUp: () {
                     if (!(ModalRoute.of(context)?.isCurrent ?? false)) return;
-                    _runWithViewerPaused(
-                      () => showDetailsSheet(context, currentFile),
-                    );
+                    unawaited(showDetailsSheet(context, currentFile));
                   },
-                  canSwipeUp: () => !_isMediaZoomed,
+                  canSwipeUp: () => !_isMediaInteractionLocked,
                   hasPointerNotifier: hasPointerOnScreenNotifier,
                   child: AnimatedOpacity(
                     opacity: _firstPhotoOpacity,
@@ -711,14 +796,22 @@ class _FullScreenMemoryState extends State<FullScreenMemory> {
                         isVideo: isVideo,
                         child: FileWidget(
                           currentFile,
+                          isActive: widget.isActive,
+                          itemIndex: safeIndex,
+                          activeItemIndexListenable:
+                              inheritedData.indexNotifier,
                           autoPlay: false,
                           tagPrefix: "memories",
                           backgroundDecoration: const BoxDecoration(
                             color: Colors.transparent,
                           ),
                           isFromMemories: true,
-                          shouldDisableScroll: (isZoomed) {
-                            _isMediaZoomed = isZoomed;
+                          isAudioMutedOverride: memoryMusic?.isMuted,
+                          shouldDisableScroll: (isLocked) {
+                            _isMediaInteractionLocked = isLocked;
+                            widget.onMediaInteractionLockChanged?.call(
+                              isLocked,
+                            );
                           },
                           playbackCallback: (shouldEnable, _) {
                             final activeIndex = _clampedMemoryIndex(
@@ -754,6 +847,17 @@ class _FullScreenMemoryState extends State<FullScreenMemory> {
             _MemoryViewerScrimsAndCaption(
               socialControlsVisible: _socialControlsVisible,
             ),
+            if (memoryMusic != null)
+              Positioned(
+                left:
+                    MediaQuery.paddingOf(context).left +
+                    _memoryOverlayHorizontalInset,
+                bottom:
+                    MediaQuery.paddingOf(context).bottom +
+                    kMemoryBottomActionBarHeight +
+                    _socialToActionBarGap,
+                child: _MemoryMusicMuteButton(memoryMusic),
+              ),
             ValueListenableBuilder<int>(
               valueListenable: inheritedData.indexNotifier,
               builder: (context, index, _) {
@@ -764,7 +868,7 @@ class _FullScreenMemoryState extends State<FullScreenMemory> {
                 if (safeIndex == null) return const SizedBox.shrink();
                 final padding = MediaQuery.paddingOf(context);
                 return Positioned(
-                  right: padding.right + _socialRightInset,
+                  right: padding.right + _memoryOverlayHorizontalInset,
                   bottom:
                       padding.bottom +
                       kMemoryBottomActionBarHeight +
@@ -851,11 +955,7 @@ class BottomIcons extends StatelessWidget {
                 color: Colors.white,
                 size: 24,
               ),
-              onPressed: () async {
-                await fullScreenState._runWithViewerPaused(
-                  () => showDetailsSheet(context, currentFile),
-                );
-              },
+              onPressed: () => showDetailsSheet(context, currentFile),
             ),
             _MemoryActionButton(
               tooltip: l10n.share,
@@ -972,6 +1072,52 @@ class _MemoryActionButton extends StatelessWidget {
         ),
         onPressed: onPressed,
         icon: icon,
+      ),
+    );
+  }
+}
+
+class _MemoryMusicMuteButton extends StatelessWidget {
+  final MemoryMusicScope memoryMusic;
+
+  const _MemoryMusicMuteButton(this.memoryMusic);
+
+  @override
+  Widget build(BuildContext context) {
+    final isMuted = memoryMusic.isMuted;
+    return SizedBox.square(
+      dimension: 48,
+      child: IconButton(
+        tooltip: isMuted
+            ? context.strings.unmuteAudio
+            : context.strings.muteAudio,
+        padding: const EdgeInsets.all(7),
+        style: IconButton.styleFrom(
+          shape: const CircleBorder(),
+          minimumSize: const Size.square(48),
+          maximumSize: const Size.square(48),
+          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          overlayColor: Colors.transparent,
+        ),
+        onPressed: () => unawaited(memoryMusic.toggleMuted()),
+        icon: DecoratedBox(
+          decoration: const BoxDecoration(
+            color: Color(0x66000000),
+            shape: BoxShape.circle,
+          ),
+          child: SizedBox.square(
+            dimension: 34,
+            child: Center(
+              child: HugeIcon(
+                icon: isMuted
+                    ? HugeIcons.strokeRoundedVolumeOff
+                    : HugeIcons.strokeRoundedVolumeHigh,
+                color: Colors.white,
+                size: 18,
+              ),
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -1175,8 +1321,6 @@ class _MemoryViewerScrimsAndCaption extends StatelessWidget {
     if (inheritedData == null || inheritedData.memories.isEmpty) {
       return const SizedBox.shrink();
     }
-    final fullScreenState = context
-        .findAncestorStateOfType<_FullScreenMemoryState>()!;
     final safePadding = MediaQuery.paddingOf(context);
     return ValueListenableBuilder<int>(
       valueListenable: inheritedData.indexNotifier,
@@ -1265,9 +1409,7 @@ class _MemoryViewerScrimsAndCaption extends StatelessWidget {
                 child: Align(
                   alignment: Alignment.centerLeft,
                   child: GestureDetector(
-                    onTap: () => fullScreenState._runWithViewerPaused(
-                      () => showDetailsSheet(context, file),
-                    ),
+                    onTap: () => unawaited(showDetailsSheet(context, file)),
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [

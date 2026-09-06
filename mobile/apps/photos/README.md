@@ -63,7 +63,7 @@ After updating Flutter dependencies, run `pod install` from `ios/` on macOS and 
 
 ## 🏙️ Attributions
 
-City coordinates from [Simple Maps](https://simplemaps.com/data/world-cities)
+See the [location dataset attribution](../../../rust/crates/location-dataset/README.md).
 
 ## 🌍 Translate
 

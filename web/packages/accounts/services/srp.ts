@@ -1,16 +1,17 @@
 import {
     deriveSubKeyBytes,
-    generateSRPSetupAttributesRust,
+    generateSRPSetup,
     toB64,
 } from "ente-accounts/services/crypto";
+import { namedError } from "ente-base/error";
 import {
     authenticatedRequestHeaders,
     ensureOk,
     publicRequestHeaders,
 } from "ente-base/http";
 import { apiURL } from "ente-base/origins";
+import { createSRPSession } from "ente-prelogin-wasm";
 import { ensure } from "ente-utils/ensure";
-import { loadEnteWasm } from "ente-wasm/load";
 import { v4 as uuidv4 } from "uuid";
 import { z } from "zod";
 import { saveSRPAttributes } from "./accounts-db";
@@ -62,10 +63,7 @@ export const generateSRPSetupAttributes = async (
     kek: string,
 ): Promise<SRPSetupAttributes> => {
     const srpUserID = uuidv4();
-    return {
-        srpUserID,
-        ...(await generateSRPSetupAttributesRust(kek, srpUserID)),
-    };
+    return { srpUserID, ...(await generateSRPSetup(kek, srpUserID)) };
 };
 
 export const setupSRP = async (srpSetupAttributes: SRPSetupAttributes) =>
@@ -89,24 +87,15 @@ const srpSetupOrReconfigure = async (
         srpUserID,
         srpSalt,
         srpVerifier,
-        srpA: session.public_a(),
+        srpA: session.publicA(),
     });
 
     const { srpM2 } = await exchangeCB({
         setupID,
-        srpM1: session.compute_m1(srpB),
+        srpM1: session.computeM1(srpB),
     });
 
-    session.verify_m2(srpM2);
-};
-
-const createSRPSession = async (
-    srpSalt: string,
-    srpUserID: string,
-    loginSubKey: string,
-) => {
-    const wasm = await loadEnteWasm();
-    return new wasm.SrpSession(srpUserID, srpSalt, loginSubKey);
+    session.verifyM2(srpM2);
 };
 
 interface SetupSRPRequest {
@@ -194,9 +183,6 @@ const updateSRPAndKeys = async (
     return UpdateSRPAndKeysResponse.parse(await res.json());
 };
 
-export const srpVerificationUnauthorizedErrorMessage =
-    "SRP verification failed (HTTP 401 Unauthorized)";
-
 const deriveSRPLoginSubKey = async (kek: string) => {
     const kekSubKeyBytes = await deriveSubKeyBytes(kek, 32, 1, "loginctx");
     return toB64(kekSubKeyBytes.slice(0, 16));
@@ -214,16 +200,16 @@ export const verifySRP = async (
 
     const { srpB, sessionID } = await createSRPSessionOnRemote({
         srpUserID,
-        srpA: session.public_a(),
+        srpA: session.publicA(),
     });
 
     const { srpM2, ...rest } = await verifySRPSession({
         sessionID,
         srpUserID,
-        srpM1: session.compute_m1(srpB),
+        srpM1: session.computeM1(srpB),
     });
 
-    session.verify_m2(srpM2);
+    session.verifyM2(srpM2);
 
     return rest;
 };
@@ -264,7 +250,10 @@ const verifySRPSession = async ({
         body: JSON.stringify({ sessionID, srpUserID, srpM1 }),
     });
     if (res.status == 401) {
-        throw new Error(srpVerificationUnauthorizedErrorMessage);
+        throw namedError(
+            "srp_verification_unauthorized",
+            "SRP verification failed (HTTP 401 Unauthorized)",
+        );
     }
     ensureOk(res);
     return RemoteSRPVerificationResponse.parse(await res.json());

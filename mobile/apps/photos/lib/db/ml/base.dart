@@ -70,7 +70,10 @@ abstract class IMLDataDB<T> {
   Future<int> getTotalFaceCount();
   Future<int> getErroredFaceCount();
   Future<Set<T>> getErroredFileIDs();
+  Future<void> pruneResolvedFaceErrorResults(List<T> fileIDs);
+  Future<Set<T>> getFileIDsWithErrorResults(List<T> fileIDs);
   Future<void> deleteFaceIndexForFiles(List<T> fileIDs);
+  Future<void> deleteUnclusteredFaceIndexForFiles(List<T> fileIDs);
   Future<int> getClusteredOrFacelessFileCount();
   Future<double> getClusteredToIndexableFilesRatio();
   Future<int> getUnclusteredFaceCount();

@@ -4,7 +4,9 @@ import "package:ente_feature_flag/ente_feature_flag.dart";
 import "package:ente_install_source/ente_install_source.dart";
 import "package:package_info_plus/package_info_plus.dart";
 import "package:photos/core/configuration.dart";
+import "package:photos/core/event_bus.dart";
 import "package:photos/core/network/endpoint_config.dart";
+import "package:photos/events/ml_consent_changed_event.dart";
 import "package:photos/gateways/billing/billing_gateway.dart";
 import "package:photos/gateways/cast/cast_gateway.dart";
 import "package:photos/gateways/collections/collection_files_gateway.dart";
@@ -29,10 +31,11 @@ import "package:photos/services/backup_preference_service.dart";
 import "package:photos/services/collections_service.dart";
 import "package:photos/services/entity_service.dart";
 import "package:photos/services/filedata/filedata_service.dart";
-import "package:photos/services/library_sharing_local_store.dart";
 import "package:photos/services/library_sharing_service.dart";
+import "package:photos/services/library_sharing_store.dart";
 import "package:photos/services/location_service.dart";
 import "package:photos/services/machine_learning/compute_controller.dart";
+import "package:photos/services/machine_learning/ml_decryption_record_store.dart";
 import "package:photos/services/magic_cache_service.dart";
 import "package:photos/services/memories_cache_service.dart";
 import "package:photos/services/permission/service.dart";
@@ -60,6 +63,7 @@ class ServiceLocator {
   late final LocalSettings localSettings;
   late final BackupSettings backupSettings;
   late final EnteWakeLockService wakeLockService;
+  late final MlDecryptionRecordStore mlDecryptionRecordStore;
 
   ServiceLocator._privateConstructor();
 
@@ -80,7 +84,8 @@ class ServiceLocator {
     endpointConfig = EndpointConfig(prefs);
     localSettings = LocalSettings(prefs);
     backupSettings = BackupSettings(prefs);
-    wakeLockService = EnteWakeLockService(prefs);
+    wakeLockService = EnteWakeLockService();
+    mlDecryptionRecordStore = MlDecryptionRecordStore(prefs);
   }
 }
 
@@ -121,6 +126,9 @@ BackupSettings get backupSettings => ServiceLocator.instance.backupSettings;
 EnteWakeLockService get wakeLockService =>
     ServiceLocator.instance.wakeLockService;
 
+MlDecryptionRecordStore get mlDecryptionRecordStore =>
+    ServiceLocator.instance.mlDecryptionRecordStore;
+
 // True when showing local-device photos instead of an Ente account. Network
 // access may still be used.
 bool get isLocalGalleryMode => localSettings.isLocalGalleryMode;
@@ -135,9 +143,10 @@ bool get hasGrantedMLConsent {
 Future<void> setMLConsent(bool enabled) async {
   if (isLocalGalleryMode) {
     await localSettings.setLocalGalleryMLConsent(enabled);
-    return;
+  } else {
+    await flagService.setMLConsent(enabled);
   }
-  await flagService.setMLConsent(enabled);
+  Bus.instance.fire(MLConsentChangedEvent(enabled));
 }
 
 bool get mapEnabled {
@@ -203,7 +212,7 @@ TrashSyncService get trashSyncService {
 
 LocationService? _locationService;
 LocationService get locationService {
-  _locationService ??= LocationService(ServiceLocator.instance.prefs);
+  _locationService ??= LocationService();
   return _locationService!;
 }
 
@@ -291,7 +300,7 @@ CollectionsService get collectionsService {
 LibrarySharingService? _librarySharingService;
 LibrarySharingService get librarySharingService {
   _librarySharingService ??= LibrarySharingService(
-    localStore: LibrarySharingLocalStore(ServiceLocator.instance.prefs),
+    store: LibrarySharingEntityStore(entityService),
   );
   return _librarySharingService!;
 }

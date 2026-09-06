@@ -1,10 +1,12 @@
 package repo
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -36,15 +38,16 @@ func (repo *FileRepository) Create(
 ) (ente.File, int64, error) {
 	hotDC := repo.S3Config.GetHotDataCenter()
 	dcsForNewEntry := pq.StringArray{hotDC}
+	if file.OwnerID != collectionOwnerID {
+		return file, -1, stacktrace.Propagate(errors.New("both file and collection should belong to same owner"), "")
+	}
 
 	ctx := context.Background()
 	tx, err := repo.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return file, -1, stacktrace.Propagate(err, "")
 	}
-	if file.OwnerID != collectionOwnerID {
-		return file, -1, stacktrace.Propagate(errors.New("both file and collection should belong to same owner"), "")
-	}
+	defer tx.Rollback()
 	var fileID int64
 	err = tx.QueryRowContext(ctx, `INSERT INTO files
 			(owner_id, encrypted_metadata,
@@ -56,7 +59,6 @@ func (repo *FileRepository) Create(
 		file.MagicMetadata, file.PubicMagicMetadata, file.Info,
 		file.UpdationTime).Scan(&fileID)
 	if err != nil {
-		tx.Rollback()
 		return file, -1, stacktrace.Propagate(err, "")
 	}
 	file.ID = fileID
@@ -65,19 +67,16 @@ func (repo *FileRepository) Create(
 			VALUES($1, $2, $3, $4, $5, $6, $7, $8)`, file.CollectionID, file.ID,
 		file.EncryptedKey, file.KeyDecryptionNonce, false, file.UpdationTime, file.OwnerID, collectionOwnerID)
 	if err != nil {
-		tx.Rollback()
 		return file, -1, stacktrace.Propagate(err, "")
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE collections SET updation_time = $1
 			WHERE collection_id = $2`, file.UpdationTime, file.CollectionID)
 	if err != nil {
-		tx.Rollback()
 		return file, -1, stacktrace.Propagate(err, "")
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO object_keys(file_id, o_type, object_key, size, datacenters)
 			VALUES($1, $2, $3, $4, $5)`, fileID, ente.FILE, file.File.ObjectKey, fileSize, dcsForNewEntry)
 	if err != nil {
-		tx.Rollback()
 		if err.Error() == "pq: duplicate key value violates unique constraint \"object_keys_object_key_key\"" {
 			return file, -1, ente.ErrDuplicateFileObjectFound
 		}
@@ -86,7 +85,6 @@ func (repo *FileRepository) Create(
 	_, err = tx.ExecContext(ctx, `INSERT INTO object_keys(file_id, o_type, object_key, size, datacenters)
 			VALUES($1, $2, $3, $4, $5)`, fileID, ente.THUMBNAIL, file.Thumbnail.ObjectKey, thumbnailSize, dcsForNewEntry)
 	if err != nil {
-		tx.Rollback()
 		if err.Error() == "pq: duplicate key value violates unique constraint \"object_keys_object_key_key\"" {
 			return file, -1, ente.ErrDuplicateThumbnailObjectFound
 		}
@@ -95,23 +93,19 @@ func (repo *FileRepository) Create(
 
 	err = repo.ObjectCleanupRepo.RemoveTempObjectKey(ctx, tx, file.File.ObjectKey, hotDC)
 	if err != nil {
-		tx.Rollback()
 		return file, -1, stacktrace.Propagate(err, "")
 	}
 	err = repo.ObjectCleanupRepo.RemoveTempObjectKey(ctx, tx, file.Thumbnail.ObjectKey, hotDC)
 	if err != nil {
-		tx.Rollback()
 		return file, -1, stacktrace.Propagate(err, "")
 	}
-	usage, err := repo.updateUsage(ctx, tx, file.OwnerID, usageDiff)
+	usage, err := repo.updateUsageForFileCreation(ctx, tx, file.OwnerID, usageDiff, app)
 	if err != nil {
-		tx.Rollback()
 		return file, -1, stacktrace.Propagate(err, "")
 	}
 
 	err = repo.markAsNeedingReplication(ctx, tx, file, hotDC)
 	if err != nil {
-		tx.Rollback()
 		return file, -1, stacktrace.Propagate(err, "")
 	}
 
@@ -127,14 +121,15 @@ func (repo *FileRepository) CreateMetaFile(
 	collectionOwnerID int64,
 	app ente.App,
 ) (*ente.File, error) {
+	if metaFile.OwnerID != collectionOwnerID {
+		return nil, stacktrace.Propagate(errors.New("both file and collection should belong to same owner"), "")
+	}
 	ctx := context.Background()
 	tx, err := repo.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, stacktrace.Propagate(err, "")
 	}
-	if metaFile.OwnerID != collectionOwnerID {
-		return nil, stacktrace.Propagate(errors.New("both file and collection should belong to same owner"), "")
-	}
+	defer tx.Rollback()
 
 	var fileID int64
 	info := &ente.FileInfo{
@@ -151,7 +146,6 @@ func (repo *FileRepository) CreateMetaFile(
 		metaFile.MagicMetadata, metaFile.PubicMagicMetadata, info,
 		metaFile.UpdationTime).Scan(&fileID)
 	if err != nil {
-		tx.Rollback()
 		return nil, stacktrace.Propagate(err, "")
 	}
 
@@ -160,11 +154,14 @@ func (repo *FileRepository) CreateMetaFile(
 			VALUES($1, $2, $3, $4, $5, $6, $7, $8)`, metaFile.CollectionID, fileID,
 		metaFile.EncryptedKey, metaFile.KeyDecryptionNonce, false, metaFile.UpdationTime, metaFile.OwnerID, collectionOwnerID)
 	if err != nil {
-		tx.Rollback()
 		return nil, stacktrace.Propagate(err, "")
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE collections SET updation_time = $1
 			WHERE collection_id = $2`, metaFile.UpdationTime, metaFile.CollectionID)
+	if err != nil {
+		return nil, stacktrace.Propagate(err, "")
+	}
+	_, err = repo.updateUsageForFileCreation(ctx, tx, metaFile.OwnerID, 0, app)
 	if err != nil {
 		tx.Rollback()
 		return nil, stacktrace.Propagate(err, "")
@@ -256,15 +253,19 @@ func (repo *FileRepository) ResetNeedsReplication(file ente.File, hotDC string) 
 	}
 }
 
-func (repo *FileRepository) Update(file ente.File, fileSize int64, thumbnailSize int64, usageDiff int64, oldObjects []string, isDuplicateRequest bool) error {
+func (repo *FileRepository) Update(file ente.File, fileSize int64, thumbnailSize int64, usageDiff int64, oldObjects []string, stagedObjects []string) error {
 	hotDC := repo.S3Config.GetHotDataCenter()
 	dcsForNewEntry := pq.StringArray{hotDC}
+	// iOS may retry after backgrounding before receiving a successful response.
+	// Only matching object keys and total size make the update a duplicate.
+	isDuplicateRequest := len(stagedObjects) == 0 && usageDiff == 0
 
 	ctx := context.Background()
 	tx, err := repo.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return stacktrace.Propagate(err, "")
 	}
+	defer tx.Rollback()
 	_, err = tx.ExecContext(ctx, `UPDATE files SET encrypted_metadata = $1,
 			file_decryption_header = $2, thumbnail_decryption_header = $3, 
 			metadata_decryption_header = $4, updation_time = $5 , info = $6 WHERE file_id = $7`,
@@ -272,14 +273,12 @@ func (repo *FileRepository) Update(file ente.File, fileSize int64, thumbnailSize
 		file.Thumbnail.DecryptionHeader, file.Metadata.DecryptionHeader,
 		file.UpdationTime, file.Info, file.ID)
 	if err != nil {
-		tx.Rollback()
 		return stacktrace.Propagate(err, "")
 	}
 	updatedRows, err := tx.QueryContext(ctx, `UPDATE collection_files 
 			SET updation_time = $1 WHERE file_id = $2 RETURNING collection_id`, file.UpdationTime,
 		file.ID)
 	if err != nil {
-		tx.Rollback()
 		return stacktrace.Propagate(err, "")
 	}
 	defer updatedRows.Close()
@@ -295,43 +294,33 @@ func (repo *FileRepository) Update(file ente.File, fileSize int64, thumbnailSize
 	_, err = tx.ExecContext(ctx, `UPDATE collections SET updation_time = $1
 			WHERE collection_id = ANY($2)`, file.UpdationTime, pq.Array(updatedCIDs))
 	if err != nil {
-		tx.Rollback()
 		return stacktrace.Propagate(err, "")
 	}
 	_, err = tx.ExecContext(ctx, `DELETE FROM object_copies WHERE object_key = ANY($1)`,
 		pq.Array(oldObjects))
 	if err != nil {
-		tx.Rollback()
 		return stacktrace.Propagate(err, "")
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE object_keys 
 			SET object_key = $1, size = $2, datacenters = $3 WHERE file_id = $4 AND o_type = $5`,
 		file.File.ObjectKey, fileSize, dcsForNewEntry, file.ID, ente.FILE)
 	if err != nil {
-		tx.Rollback()
 		return stacktrace.Propagate(err, "")
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE object_keys 
 			SET object_key = $1, size = $2, datacenters = $3 WHERE file_id = $4 AND o_type = $5`,
 		file.Thumbnail.ObjectKey, thumbnailSize, dcsForNewEntry, file.ID, ente.THUMBNAIL)
 	if err != nil {
-		tx.Rollback()
 		return stacktrace.Propagate(err, "")
 	}
-	_, err = repo.updateUsage(ctx, tx, file.OwnerID, usageDiff)
+	_, err = repo.updateUsage(ctx, tx, file.OwnerID, usageDiff, 0, 0)
 	if err != nil {
-		tx.Rollback()
 		return stacktrace.Propagate(err, "")
 	}
-	err = repo.ObjectCleanupRepo.RemoveTempObjectKey(ctx, tx, file.File.ObjectKey, hotDC)
-	if err != nil {
-		tx.Rollback()
-		return stacktrace.Propagate(err, "")
-	}
-	err = repo.ObjectCleanupRepo.RemoveTempObjectKey(ctx, tx, file.Thumbnail.ObjectKey, hotDC)
-	if err != nil {
-		tx.Rollback()
-		return stacktrace.Propagate(err, "")
+	for _, objectKey := range stagedObjects {
+		if err = repo.ObjectCleanupRepo.RemoveTempObjectKey(ctx, tx, objectKey, hotDC); err != nil {
+			return stacktrace.Propagate(err, "")
+		}
 	}
 	if isDuplicateRequest {
 		// Re-inserting object_copies on a duplicate request violates its primary
@@ -340,13 +329,11 @@ func (repo *FileRepository) Update(file ente.File, fileSize int64, thumbnailSize
 	} else {
 		err = repo.markAsNeedingReplication(ctx, tx, file, hotDC)
 		if err != nil {
-			tx.Rollback()
 			return stacktrace.Propagate(err, "")
 		}
 	}
 	err = repo.QueueRepo.AddItems(ctx, tx, OutdatedObjectsQueue, oldObjects)
 	if err != nil {
-		tx.Rollback()
 		return stacktrace.Propagate(err, "")
 	}
 	err = tx.Commit()
@@ -359,11 +346,15 @@ func (repo *FileRepository) UpdateMagicAttributes(
 	isPublicMetadata bool,
 	skipVersion *bool,
 ) error {
+	slices.SortStableFunc(fileUpdates, func(a, b ente.UpdateMagicMetadata) int {
+		return cmp.Compare(a.ID, b.ID)
+	})
 	updationTime := time.Microseconds()
 	tx, err := repo.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return stacktrace.Propagate(err, "")
 	}
+	defer tx.Rollback()
 	fileIDs := make([]int64, 0)
 	for _, update := range fileUpdates {
 		update.MagicMetadata.Version = update.MagicMetadata.Version + 1
@@ -376,10 +367,6 @@ func (repo *FileRepository) UpdateMagicAttributes(
 				update.MagicMetadata, updationTime, update.ID)
 		}
 		if err != nil {
-			if rollbackErr := tx.Rollback(); rollbackErr != nil {
-				log.WithError(rollbackErr).Error("transaction rollback failed")
-				return stacktrace.Propagate(rollbackErr, "")
-			}
 			return stacktrace.Propagate(err, "")
 		}
 	}
@@ -391,10 +378,6 @@ func (repo *FileRepository) UpdateMagicAttributes(
 			SET updation_time = $1 WHERE file_id = ANY($2) AND is_deleted= false RETURNING collection_id`, updationTime,
 		pq.Array(fileIDs))
 	if err != nil {
-		if rollbackErr := tx.Rollback(); rollbackErr != nil {
-			log.WithError(rollbackErr).Error("transaction rollback failed")
-			return stacktrace.Propagate(rollbackErr, "")
-		}
 		return stacktrace.Propagate(err, "")
 	}
 	defer updatedRows.Close()
@@ -410,10 +393,6 @@ func (repo *FileRepository) UpdateMagicAttributes(
 	_, err = tx.ExecContext(ctx, `UPDATE collections SET updation_time = $1
 			WHERE collection_id = ANY($2)`, updationTime, pq.Array(updatedCIDs))
 	if err != nil {
-		if rollbackErr := tx.Rollback(); rollbackErr != nil {
-			log.WithError(rollbackErr).Error("transaction rollback failed")
-			return stacktrace.Propagate(rollbackErr, "")
-		}
 		return stacktrace.Propagate(err, "")
 	}
 	return tx.Commit()
@@ -427,6 +406,7 @@ func (repo *FileRepository) UpdateThumbnail(ctx context.Context, fileID int64, u
 	if err != nil {
 		return stacktrace.Propagate(err, "")
 	}
+	defer tx.Rollback()
 	updationTime := time.Microseconds()
 	_, err = tx.ExecContext(ctx, `UPDATE files SET 
 			thumbnail_decryption_header = $1, 
@@ -434,14 +414,12 @@ func (repo *FileRepository) UpdateThumbnail(ctx context.Context, fileID int64, u
 		thumbnail.DecryptionHeader,
 		updationTime, fileID)
 	if err != nil {
-		tx.Rollback()
 		return stacktrace.Propagate(err, "")
 	}
 	updatedRows, err := tx.QueryContext(ctx, `UPDATE collection_files 
 			SET updation_time = $1 WHERE file_id = $2 RETURNING collection_id`, updationTime,
 		fileID)
 	if err != nil {
-		tx.Rollback()
 		return stacktrace.Propagate(err, "")
 	}
 	defer updatedRows.Close()
@@ -457,14 +435,12 @@ func (repo *FileRepository) UpdateThumbnail(ctx context.Context, fileID int64, u
 	_, err = tx.ExecContext(ctx, `UPDATE collections SET updation_time = $1
 			WHERE collection_id = ANY($2)`, updationTime, pq.Array(updatedCIDs))
 	if err != nil {
-		tx.Rollback()
 		return stacktrace.Propagate(err, "")
 	}
 	if oldThumbnailObject != nil {
 		_, err = tx.ExecContext(ctx, `DELETE FROM object_copies WHERE object_key = $1`,
 			*oldThumbnailObject)
 		if err != nil {
-			tx.Rollback()
 			return stacktrace.Propagate(err, "")
 		}
 	}
@@ -472,19 +448,17 @@ func (repo *FileRepository) UpdateThumbnail(ctx context.Context, fileID int64, u
 			SET object_key = $1, size = $2, datacenters = $3 WHERE file_id = $4 AND o_type = $5`,
 		thumbnail.ObjectKey, thumbnailSize, dcsForNewEntry, fileID, ente.THUMBNAIL)
 	if err != nil {
-		tx.Rollback()
 		return stacktrace.Propagate(err, "")
 	}
-	_, err = repo.updateUsage(ctx, tx, userID, usageDiff)
+	_, err = repo.updateUsage(ctx, tx, userID, usageDiff, 0, 0)
 	if err != nil {
-		tx.Rollback()
 		return stacktrace.Propagate(err, "")
 	}
 
-	err = repo.ObjectCleanupRepo.RemoveTempObjectKey(ctx, tx, thumbnail.ObjectKey, hotDC)
-	if err != nil {
-		tx.Rollback()
-		return stacktrace.Propagate(err, "")
+	if oldThumbnailObject != nil {
+		if err = repo.ObjectCleanupRepo.RemoveTempObjectKey(ctx, tx, thumbnail.ObjectKey, hotDC); err != nil {
+			return stacktrace.Propagate(err, "")
+		}
 	}
 	err = repo.markThumbnailAsNeedingReplication(ctx, tx, thumbnail.ObjectKey, hotDC)
 	if err != nil {
@@ -493,7 +467,6 @@ func (repo *FileRepository) UpdateThumbnail(ctx context.Context, fileID int64, u
 	if oldThumbnailObject != nil {
 		err = repo.QueueRepo.AddItems(ctx, tx, OutdatedObjectsQueue, []string{*oldThumbnailObject})
 		if err != nil {
-			tx.Rollback()
 			return stacktrace.Propagate(err, "")
 		}
 	}
@@ -802,29 +775,40 @@ func (repo *FileRepository) scheduleDeletion(ctx context.Context, tx *sql.Tx, fi
 		totalObjectSize += object.FileSize
 	}
 	diff = diff - (totalObjectSize)
-	_, err = repo.updateUsage(ctx, tx, userID, diff)
+	_, err = repo.updateUsage(ctx, tx, userID, diff, 0, 0)
 	return stacktrace.Propagate(err, "")
 }
 
-func (repo *FileRepository) updateUsage(ctx context.Context, tx *sql.Tx, userID int64, diff int64) (int64, error) {
-	row := tx.QueryRowContext(ctx, `SELECT storage_consumed FROM usage WHERE user_id = $1 FOR UPDATE`, userID)
+func (repo *FileRepository) updateUsageForFileCreation(ctx context.Context, tx *sql.Tx, userID, storageDiff int64, app ente.App) (int64, error) {
+	switch app {
+	case ente.Photos:
+		return repo.updateUsage(ctx, tx, userID, storageDiff, 1, 0)
+	case ente.Locker:
+		return repo.updateUsage(ctx, tx, userID, storageDiff, 0, 1)
+	default:
+		return -1, stacktrace.Propagate(ente.ErrInvalidApp, "")
+	}
+}
+
+func (repo *FileRepository) updateUsage(ctx context.Context, tx *sql.Tx, userID, storageDiff, photosFileCountDiff, lockerFileCountDiff int64) (int64, error) {
+	fileCountSourceVersionDiff := int64(0)
+	if photosFileCountDiff != 0 || lockerFileCountDiff != 0 {
+		fileCountSourceVersionDiff = 1
+	}
 	var usage int64
-	err := row.Scan(&usage)
+	err := tx.QueryRowContext(ctx, `UPDATE usage SET
+			storage_consumed = storage_consumed + $2,
+			photos_file_count = photos_file_count + $3,
+			locker_file_count = locker_file_count + $4,
+			file_count_source_version = file_count_source_version + $5
+			WHERE user_id = $1
+			RETURNING storage_consumed`,
+		userID, storageDiff, photosFileCountDiff, lockerFileCountDiff, fileCountSourceVersionDiff).Scan(&usage)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			usage = 0
-		} else {
-			return -1, stacktrace.Propagate(err, "")
+			return -1, stacktrace.Propagate(err, "missing usage row for user %d", userID)
 		}
-	}
-	newUsage := usage + diff
-	_, err = tx.ExecContext(ctx, `INSERT INTO usage (user_id, storage_consumed)
-			VALUES ($1, $2)
-			ON CONFLICT (user_id) DO UPDATE
-				SET storage_consumed = $2`,
-		userID, newUsage)
-	if err != nil {
 		return -1, stacktrace.Propagate(err, "")
 	}
-	return newUsage, nil
+	return usage, nil
 }
